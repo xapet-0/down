@@ -325,6 +325,25 @@ class GeminiBot:
         except Exception:
             return ""
 
+    def _find_response_with_times(self, page, start_time, end_time):
+        script = """(data) => {
+            const nodes = Array.from(
+                document.querySelectorAll('model-response, div[role="article"], div[data-response-id]')
+            );
+            const haystack = nodes.length ? nodes : Array.from(document.querySelectorAll('main div'));
+            for (const node of haystack) {
+                const text = node.innerText || '';
+                if (text.includes(data.start) && text.includes(data.end)) {
+                    return text;
+                }
+            }
+            return '';
+        }"""
+        try:
+            return page.evaluate(script, {"start": start_time, "end": end_time})
+        except Exception:
+            return ""
+
     def _is_streaming(self, page):
         script = """() => {
             const resp = document.querySelectorAll('model-response');
@@ -417,6 +436,21 @@ class GeminiBot:
             return text
         self.logger.warn("DOM extraction failed. Trying clipboard fallback...")
         return self._copy_response_via_keyboard(page)
+
+    def fetch_response_with_times(self, page, start_time, end_time):
+        text = self._find_response_with_times(page, start_time, end_time)
+        if text.strip():
+            return text
+        return self.fetch_latest_response(page)
+
+    def refresh_page(self, page):
+        try:
+            page.reload()
+            page.wait_for_selector("div[contenteditable='true'], textarea", timeout=15000)
+            time.sleep(1.0)
+            return True
+        except Exception:
+            return False
 
     def _copy_response_via_keyboard(self, page):
         try:
@@ -626,13 +660,21 @@ class EagleProcessor:
             finished = bot.wait_for_completion(page)
             if not finished:
                 self.logger.warn("Gemini did not finish in time.")
+                if attempt == 1:
+                    self.logger.warn("Refreshing page and retrying send.")
+                    bot.refresh_page(page)
                 continue
             response_text = ""
             if self.config.auto_copy:
-                response_text = bot.fetch_latest_response(page)
+                response_text = bot.fetch_response_with_times(
+                    page, chunk[0]["time"], chunk[-1]["time"]
+                )
             if response_text.strip():
                 return response_text
             self.logger.warn("Extraction failed.")
+            if attempt == 1:
+                self.logger.warn("Refreshing page and retrying send.")
+                bot.refresh_page(page)
         return ""
 
     def _log_chunk_details(self, label, chunk, matches):
