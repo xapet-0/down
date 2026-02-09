@@ -9,7 +9,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import List, Optional
 
 from playwright.sync_api import sync_playwright
@@ -32,6 +32,7 @@ DEFAULT_HISTORY_FILE = "eagle_history.json"
 DEFAULT_BATCH = 30
 DEFAULT_POLL_DELAY = 1.0
 DEFAULT_MAX_RETRIES = 2
+DEFAULT_PROMPTS_FILE = "eagle_prompts.json"
 
 SACRED_PROMPT = """SYSTEM MODE: EXPERT TECHNICAL INSTRUCTOR & TRANSLATOR.
 TARGET LANGUAGE: ARABIC (Professional, Academic, RTL-Optimized).
@@ -140,6 +141,44 @@ class EagleLog:
 
     def error(self, message):
         self.write_func(f"❌ Eagle: {message}")
+
+
+class PromptManager:
+    def __init__(self, path):
+        self.path = path
+        self._prompts = self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump(self._prompts, handle, indent=2, ensure_ascii=False)
+
+    def get_default(self):
+        return SACRED_PROMPT
+
+    def list_names(self):
+        return sorted(self._prompts.keys())
+
+    def get_prompt(self, name):
+        return self._prompts.get(name, "")
+
+    def upsert_prompt(self, name, text):
+        self._prompts[name] = text
+        self._save()
+
+    def delete_prompt(self, name):
+        if name in self._prompts:
+            del self._prompts[name]
+            self._save()
 
 
 class HistoryManager:
@@ -270,9 +309,10 @@ class TranscriptParser:
 
 
 class GeminiBot:
-    def __init__(self, config, logger):
+    def __init__(self, config, logger, prompt_provider):
         self.config = config
         self.logger = logger
+        self.prompt_provider = prompt_provider
         self._last_sent = ""
 
     def connect(self):
@@ -362,7 +402,8 @@ class GeminiBot:
         text_payload = "".join(
             f"{b['id']}\n{b['time']}\n{b['text']}\n\n" for b in blocks
         )
-        msg = SACRED_PROMPT + "\n" + text_payload.strip()
+        prompt_text = self.prompt_provider()
+        msg = prompt_text + "\n" + text_payload.strip()
 
         self.logger.info(
             f"Sending batch [{blocks[0]['id']} -> {blocks[-1]['id']}] ({len(blocks)} lines)."
@@ -697,6 +738,8 @@ class EagleGUI:
         self.selected_dir = tk.StringVar()
         self.auto_copy_var = tk.BooleanVar(value=config.auto_copy)
         self.batch_var = tk.IntVar(value=config.batch_size)
+        self.prompt_manager = PromptManager(DEFAULT_PROMPTS_FILE)
+        self.selected_prompt = tk.StringVar(value="Default")
         self.status_queue = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
         self._build_ui()
@@ -731,7 +774,15 @@ class EagleGUI:
         ttk.Button(controls, text="🚀 Start", command=self._start).pack(side="left")
         ttk.Button(controls, text="🛑 Stop", command=self._stop).pack(side="left", padx=5)
 
-        list_frame = ttk.LabelFrame(self.root, text="Files", padding=10)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=5)
+
+        main_tab = ttk.Frame(notebook)
+        prompt_tab = ttk.Frame(notebook)
+        notebook.add(main_tab, text="Workflow")
+        notebook.add(prompt_tab, text="Prompt Settings")
+
+        list_frame = ttk.LabelFrame(main_tab, text="Files", padding=10)
         list_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.tree = ttk.Treeview(list_frame, columns=("status", "path"), show="headings")
@@ -741,15 +792,45 @@ class EagleGUI:
         self.tree.column("path", width=720)
         self.tree.pack(fill="both", expand=True)
 
-        manual_frame = ttk.LabelFrame(self.root, text="Manual Paste Area", padding=10)
+        manual_frame = ttk.LabelFrame(main_tab, text="Manual Paste Area", padding=10)
         manual_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self.manual_text = scrolledtext.ScrolledText(manual_frame, height=6, wrap="word")
         self.manual_text.pack(fill="both", expand=True)
 
-        log_frame = ttk.LabelFrame(self.root, text="Log", padding=10)
+        log_frame = ttk.LabelFrame(main_tab, text="Log", padding=10)
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self.log_box = tk.Text(log_frame, height=8, state="disabled", wrap="word")
         self.log_box.pack(fill="both", expand=True)
+
+        prompt_frame = ttk.LabelFrame(prompt_tab, text="Prompt Manager", padding=10)
+        prompt_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        prompt_controls = ttk.Frame(prompt_frame)
+        prompt_controls.pack(fill="x")
+        ttk.Label(prompt_controls, text="Select Prompt").pack(side="left")
+        self.prompt_combo = ttk.Combobox(
+            prompt_controls, textvariable=self.selected_prompt, state="readonly", width=30
+        )
+        self.prompt_combo.pack(side="left", padx=8)
+        self.prompt_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_prompt())
+
+        ttk.Button(prompt_controls, text="New", command=self._new_prompt).pack(
+            side="left", padx=5
+        )
+        ttk.Button(prompt_controls, text="Save/Update", command=self._save_prompt).pack(
+            side="left", padx=5
+        )
+        self.delete_prompt_btn = ttk.Button(
+            prompt_controls, text="Delete", command=self._delete_prompt
+        )
+        self.delete_prompt_btn.pack(side="left", padx=5)
+
+        self.prompt_text = scrolledtext.ScrolledText(
+            prompt_frame, height=18, wrap="word"
+        )
+        self.prompt_text.pack(fill="both", expand=True, pady=10)
+
+        self._refresh_prompt_list()
 
     def _choose_folder(self):
         folder = filedialog.askdirectory()
@@ -787,7 +868,7 @@ class EagleGUI:
     def _run_processing(self):
         logger = EagleLog(self.status_queue.put)
         processor = EagleProcessor(self.config, logger, self._manual_dialog)
-        bot = GeminiBot(self.config, logger)
+        bot = GeminiBot(self.config, logger, self._current_prompt_text)
         playwright, browser, page = bot.connect()
         try:
             processor.process(self.files, bot, page)
@@ -854,6 +935,55 @@ class EagleGUI:
         self.log_box.configure(state="disabled")
         self.log_box.see("end")
 
+    def _refresh_prompt_list(self):
+        names = ["Default"] + self.prompt_manager.list_names()
+        self.prompt_combo["values"] = names
+        if self.selected_prompt.get() not in names:
+            self.selected_prompt.set("Default")
+        self._load_prompt()
+
+    def _load_prompt(self):
+        name = self.selected_prompt.get()
+        if name == "Default":
+            self.prompt_text.delete("1.0", "end")
+            self.prompt_text.insert("1.0", self.prompt_manager.get_default())
+            self.delete_prompt_btn.configure(state="disabled")
+        else:
+            self.prompt_text.delete("1.0", "end")
+            self.prompt_text.insert("1.0", self.prompt_manager.get_prompt(name))
+            self.delete_prompt_btn.configure(state="normal")
+
+    def _new_prompt(self):
+        self.selected_prompt.set("Custom")
+        self.prompt_text.delete("1.0", "end")
+        self.delete_prompt_btn.configure(state="disabled")
+
+    def _save_prompt(self):
+        text = self.prompt_text.get("1.0", "end").strip()
+        if not text:
+            messagebox.showwarning("Prompt", "Prompt text cannot be empty.")
+            return
+        name = self.selected_prompt.get()
+        if name in ("Default", "", "Custom"):
+            name = simpledialog.askstring("Prompt Name", "Enter a name for this prompt:")
+            if not name:
+                return
+        self.prompt_manager.upsert_prompt(name, text)
+        self.selected_prompt.set(name)
+        self._refresh_prompt_list()
+
+    def _delete_prompt(self):
+        name = self.selected_prompt.get()
+        if name == "Default":
+            return
+        if messagebox.askyesno("Delete Prompt", f"Delete '{name}' prompt?"):
+            self.prompt_manager.delete_prompt(name)
+            self.selected_prompt.set("Default")
+            self._refresh_prompt_list()
+
+    def _current_prompt_text(self):
+        return self.prompt_text.get("1.0", "end").strip() or self.prompt_manager.get_default()
+
     def run(self):
         self.root.mainloop()
 
@@ -911,7 +1041,7 @@ def run_cli(config):
         status = processor.build_status(file_path)
         logger.info(f"{status} {os.path.relpath(file_path, target_dir)}")
     logger.info("Starting processing...")
-    bot = GeminiBot(config, logger)
+    bot = GeminiBot(config, logger, lambda: SACRED_PROMPT)
     playwright, browser, page = bot.connect()
     try:
         processor.process(files, bot, page)
