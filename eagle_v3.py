@@ -257,6 +257,17 @@ class TranscriptParser:
         last_id = matches[-1].splitlines()[0].strip()
         return first_id, last_id
 
+    @staticmethod
+    def extract_first_last_times(text):
+        clean_text = text.replace("```srt", "").replace("```", "").strip()
+        regex_time = r"(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})\\s*-->\\s*(\\d{2}:\\d{2}:\\d{2}[,.]\\d{3})"
+        matches = re.findall(regex_time, clean_text)
+        if not matches:
+            return None, None
+        first_time = matches[0][0].replace(".", ",")
+        last_time = matches[-1][0].replace(".", ",")
+        return first_time, last_time
+
 
 class GeminiBot:
     def __init__(self, config, logger):
@@ -423,7 +434,16 @@ class GeminiBot:
 
 
 class ManualDialog(tk.Toplevel):
-    def __init__(self, parent, prompt, expected_first, expected_last, last_saved_id):
+    def __init__(
+        self,
+        parent,
+        prompt,
+        expected_first,
+        expected_last,
+        expected_first_time,
+        expected_last_time,
+        last_saved_id,
+    ):
         super().__init__(parent)
         self.title("Manual Handover Required")
         self.geometry("650x360")
@@ -431,13 +451,18 @@ class ManualDialog(tk.Toplevel):
         self.expected_first = expected_first
         self.expected_last = expected_last
         self.last_saved_id = last_saved_id
+        self.expected_first_time = expected_first_time
+        self.expected_last_time = expected_last_time
         self.attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         ttk.Label(self, text=prompt, wraplength=600).pack(pady=8)
         ttk.Label(
             self,
-            text=f"Current Progress: IDs {expected_first} -> {expected_last}",
+            text=(
+                f"Current Progress: IDs {expected_first} -> {expected_last} | "
+                f"Times {expected_first_time} -> {expected_last_time}"
+            ),
         ).pack(pady=2)
         ttk.Label(self, text=f"Last Successfully Saved: ID {last_saved_id}").pack(pady=2)
         self.text_area = scrolledtext.ScrolledText(self, height=8, wrap="word")
@@ -447,23 +472,35 @@ class ManualDialog(tk.Toplevel):
     def _on_confirm(self):
         pasted = self.text_area.get("1.0", "end").strip()
         first_id, last_id = TranscriptParser.extract_first_last_ids(pasted)
-        if not first_id or not last_id:
+        first_time, last_time = TranscriptParser.extract_first_last_times(pasted)
+        if (first_id and last_id) or (first_time and last_time):
+            if first_id and last_id:
+                id_match = first_id == self.expected_first and last_id == self.expected_last
+            else:
+                id_match = False
+            if first_time and last_time:
+                time_match = (
+                    first_time == self.expected_first_time
+                    and last_time == self.expected_last_time
+                )
+            else:
+                time_match = False
+            if id_match or time_match:
+                self.result_text = pasted
+                self.destroy()
+                return
             SoundPlayer.play_error()
             messagebox.showwarning(
                 "Mismatch",
-                "Could not detect block IDs. Please paste the correct SRT chunk.",
+                f"Mismatch! Expected IDs {self.expected_first}-{self.expected_last} or "
+                f"times {self.expected_first_time}-{self.expected_last_time}. Please copy the correct part.",
             )
             return
-        if first_id != self.expected_first or last_id != self.expected_last:
-            SoundPlayer.play_error()
-            messagebox.showwarning(
-                "Mismatch",
-                f"Mismatch! Expected lines {self.expected_first}-{self.expected_last}, "
-                f"but you pasted lines {first_id}-{last_id}. Please copy the correct part.",
-            )
-            return
-        self.result_text = pasted
-        self.destroy()
+        SoundPlayer.play_error()
+        messagebox.showwarning(
+            "Mismatch",
+            "Could not detect block IDs or timestamps. Please paste the correct SRT chunk.",
+        )
 
     def _on_close(self):
         self.destroy()
@@ -532,6 +569,8 @@ class EagleProcessor:
                     "Automation Failed. Please manually copy the translation from the browser and paste it here.",
                     chunk[0]["id"],
                     chunk[-1]["id"],
+                    chunk[0]["time"],
+                    chunk[-1]["time"],
                     self.last_saved_id,
                 )
 
@@ -557,6 +596,8 @@ class EagleProcessor:
                     "Mismatch detected. Paste correct translation here.",
                     chunk[0]["id"],
                     chunk[-1]["id"],
+                    chunk[0]["time"],
+                    chunk[-1]["time"],
                     self.last_saved_id,
                 )
                 srt_matches = TranscriptParser.extract_srt_blocks(response_text)
@@ -720,22 +761,47 @@ class EagleGUI:
         if self.worker_thread and self.worker_thread.is_alive():
             self.root.after(200, self._poll_status)
 
-    def _manual_dialog(self, prompt, expected_first, expected_last, last_saved_id):
+    def _manual_dialog(
+        self,
+        prompt,
+        expected_first,
+        expected_last,
+        expected_first_time,
+        expected_last_time,
+        last_saved_id,
+    ):
         manual_text = self.manual_text.get("1.0", "end").strip()
         if manual_text:
             first_id, last_id = TranscriptParser.extract_first_last_ids(manual_text)
-            if first_id == expected_first and last_id == expected_last:
+            first_time, last_time = TranscriptParser.extract_first_last_times(manual_text)
+            id_match = (
+                first_id == expected_first and last_id == expected_last
+                if first_id and last_id
+                else False
+            )
+            time_match = (
+                first_time == expected_first_time and last_time == expected_last_time
+                if first_time and last_time
+                else False
+            )
+            if id_match or time_match:
                 self.manual_text.delete("1.0", "end")
                 return manual_text
             SoundPlayer.play_error()
             messagebox.showwarning(
                 "Mismatch",
-                f"Mismatch! Expected lines {expected_first}-{expected_last}, "
-                f"but you pasted lines {first_id}-{last_id}. Please copy the correct part.",
+                f"Mismatch! Expected IDs {expected_first}-{expected_last} or "
+                f"times {expected_first_time}-{expected_last_time}. Please copy the correct part.",
             )
             return ""
         dialog = ManualDialog(
-            self.root, prompt, expected_first, expected_last, last_saved_id
+            self.root,
+            prompt,
+            expected_first,
+            expected_last,
+            expected_first_time,
+            expected_last_time,
+            last_saved_id,
         )
         self.root.wait_window(dialog)
         return dialog.result_text
@@ -753,17 +819,38 @@ class EagleGUI:
 def run_cli(config):
     logger = EagleLog(print)
 
-    def manual_provider(prompt, expected_first, expected_last, last_saved_id):
+    def manual_provider(
+        prompt,
+        expected_first,
+        expected_last,
+        expected_first_time,
+        expected_last_time,
+        last_saved_id,
+    ):
         print(prompt)
-        print(f"Expected IDs: {expected_first} -> {expected_last}")
+        print(
+            f"Expected IDs: {expected_first} -> {expected_last} | "
+            f"Times: {expected_first_time} -> {expected_last_time}"
+        )
         print(f"Last Saved ID: {last_saved_id}")
         pasted = input("Paste translation: ")
         first_id, last_id = TranscriptParser.extract_first_last_ids(pasted)
-        if first_id != expected_first or last_id != expected_last:
+        first_time, last_time = TranscriptParser.extract_first_last_times(pasted)
+        id_match = (
+            first_id == expected_first and last_id == expected_last
+            if first_id and last_id
+            else False
+        )
+        time_match = (
+            first_time == expected_first_time and last_time == expected_last_time
+            if first_time and last_time
+            else False
+        )
+        if not (id_match or time_match):
             SoundPlayer.play_error()
             print(
-                f"Mismatch! Expected lines {expected_first}-{expected_last}, "
-                f"but you pasted lines {first_id}-{last_id}. Try again."
+                f"Mismatch! Expected IDs {expected_first}-{expected_last} or "
+                f"times {expected_first_time}-{expected_last_time}. Try again."
             )
             return ""
         return pasted
